@@ -1,3 +1,4 @@
 .env
 transcript.txt
 *.json
+*.mp4

@@ -1,110 +1,107 @@
 """
-api.py — Transcription Segmentation REST API
-=============================================
-Direct endpoints (no file upload, reads from server):
-  POST /transcript/process            — full result in one call
-  POST /transcript/process/titles     — only titles in one call
-  POST /transcript/process/segments   — only segments in one call
-  POST /transcript/process/summaries  — only summaries in one call
+api.py — Full Pipeline REST API
+=================================
+Endpoints:
 
-Job-based endpoints (manual job_id):
-  POST /transcript                    — submit transcript, returns job_id
-  GET  /transcript/{job_id}           — full result
-  GET  /transcript/{job_id}/titles    — only titles
-  GET  /transcript/{job_id}/segments  — only segments
-  GET  /transcript/{job_id}/summaries — only summaries
+  STATUS
+    GET  /status                      — check which files exist on server
+
+  TRANSCRIPTION
+    POST /transcribe/video            — upload a video file → transcript.txt → return transcript
+    POST /transcribe/youtube          — provide YouTube URL → transcript.txt → return transcript
+    GET  /transcript                  — get saved transcript.txt
+
+  SEGMENTATION
+    POST /segment                     — segment transcript.txt → segments.json → return segments
+    POST /segment/titles              — segment → return titles only
+    POST /segment/summaries           — segment → return summaries only
+    GET  /segments                    — get saved segments.json
+
+  DESCRIPTION
+    POST /describe                    — describe segments.json → content_description.json → return description
+    GET  /describe                    — get saved content_description.json
+
+  FULL PIPELINE
+    POST /pipeline/video              — upload video → all 3 steps → return full result
+    POST /pipeline/youtube            — YouTube URL → all 3 steps → return full result
 
 Run:
   uvicorn api:app --reload
 """
 
 import os
-import uuid
+import json
+import time
+import tempfile
+import shutil
 from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from groq import Groq
 
-from core import run_pipeline, TopicSegment
+from transcriber import transcribe_from_video, transcribe_from_youtube
+from segmenter   import segment_transcript
+from describer  import build_segments_summary, generate_description
 
 load_dotenv(Path(__file__).parent / ".env")
 
 
 # ─────────────────────────────────────────────
-# CONFIG — edit these values directly
+# CONFIG
 # ─────────────────────────────────────────────
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
-
-# Path to the transcript file written by your extraction tool
-# Can be absolute or relative to this file
-TRANSCRIPT_FILE = Path(__file__).parent / "transcript.txt"
-
-# ─────────────────────────────────────────────
-# In-memory job store  { job_id: dict }
-# ─────────────────────────────────────────────
-
-store: dict[str, dict] = {}
+GROQ_MODEL       = "llama-3.3-70b-versatile"
+DIR              = Path(__file__).parent
+TRANSCRIPT_FILE  = DIR / "transcript.txt"
+SEGMENTS_FILE    = DIR / "segments.json"
+DESCRIPTION_FILE = DIR / "content_description.json"
 
 
 # ─────────────────────────────────────────────
-# Pydantic response models
+# Pydantic models
 # ─────────────────────────────────────────────
+
+class YoutubeRequest(BaseModel):
+    url: str
 
 class SegmentOut(BaseModel):
     index: int
     title: str
     summary: str
     text: str
-    start_line: int
-    end_line: int
+    start_time: str
+    end_time: str
 
+class StatusResponse(BaseModel):
+    transcript: bool
+    segments: bool
+    description: bool
 
-class TranscriptResult(BaseModel):
-    job_id: str
-    status: str
-    segments: list[SegmentOut] = []
-    error: Optional[str] = None
+class TranscribeResponse(BaseModel):
+    transcript: str
 
+class SegmentResponse(BaseModel):
+    segments: list[SegmentOut]
 
-class TitlesResult(BaseModel):
-    job_id: str
+class TitlesResponse(BaseModel):
     titles: list[str]
 
-
-class SegmentsResult(BaseModel):
-    job_id: str
-    segments: list[dict]
-
-
-class SummariesResult(BaseModel):
-    job_id: str
+class SummariesResponse(BaseModel):
     summaries: list[dict]
 
+class DescribeResponse(BaseModel):
+    summary: str
+    tone_and_style: str
+    seo_tags: list[str]
 
-class SubmitResponse(BaseModel):
-    job_id: str
-    message: str
-
-
-# Direct response models (no job_id)
-class DirectTranscriptResult(BaseModel):
-    segments: list[SegmentOut] = []
-
-
-class DirectTitlesResult(BaseModel):
-    titles: list[str]
-
-
-class DirectSegmentsResult(BaseModel):
-    segments: list[dict]
-
-
-class DirectSummariesResult(BaseModel):
-    summaries: list[dict]
+class PipelineResponse(BaseModel):
+    transcript: str
+    segments: list[SegmentOut]
+    description: DescribeResponse
 
 
 # ─────────────────────────────────────────────
@@ -112,9 +109,9 @@ class DirectSummariesResult(BaseModel):
 # ─────────────────────────────────────────────
 
 app = FastAPI(
-    title="Transcription Segmentation API",
-    description="Segment transcripts by topic using Groq LLM.",
-    version="3.0.0",
+    title="Video Pipeline API",
+    description="Full pipeline: video/YouTube → transcribe → segment → describe.",
+    version="4.0.0",
 )
 
 app.add_middleware(
@@ -129,148 +126,230 @@ app.add_middleware(
 # Shared helpers
 # ─────────────────────────────────────────────
 
-def _read_transcript() -> str:
-    """Read transcript from the fixed file path set in CONFIG."""
-    if not TRANSCRIPT_FILE.exists():
-        raise HTTPException(
-            status_code=404,
-            detail=f"Transcript file not found at: {TRANSCRIPT_FILE}"
-        )
-    return TRANSCRIPT_FILE.read_text(encoding="utf-8")
-
-
-def _get_api_key() -> str:
+def _client() -> Groq:
     key = os.getenv("GROQ_API_KEY")
     if not key:
         raise HTTPException(status_code=500, detail="GROQ_API_KEY not set in .env file.")
-    return key
+    return Groq(api_key=key)
 
 
-def _segments_to_dicts(segments: list[TopicSegment]) -> list[dict]:
-    return [
-        {
-            "index": seg.index,
-            "title": seg.title,
-            "summary": seg.summary,
-            "text": seg.text,
-            "start_line": seg.start_line,
-            "end_line": seg.end_line,
-        }
-        for seg in segments
-    ]
+def _require_file(path: Path, hint: str) -> None:
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"{path.name} not found. {hint}")
 
 
-def _get_job(job_id: str) -> dict:
-    job = store.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
-    if job["status"] == "error":
-        raise HTTPException(status_code=500, detail=job.get("error", "Pipeline failed."))
-    return job
+def _save_transcript(transcript: str) -> None:
+    TRANSCRIPT_FILE.write_text(transcript, encoding="utf-8")
+
+
+def _save_segments(segments: list[dict]) -> None:
+    SEGMENTS_FILE.write_text(json.dumps(segments, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _save_description(description: dict) -> None:
+    DESCRIPTION_FILE.write_text(json.dumps(description, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _to_segment_out(segments: list[dict]) -> list[SegmentOut]:
+    return [SegmentOut(**seg) for seg in segments]
+
+
+async def _save_upload(file: UploadFile) -> str:
+    """Save an uploaded video file to a temp location and return the path."""
+    tmp_dir  = tempfile.mkdtemp()
+    tmp_path = os.path.join(tmp_dir, file.filename)
+    content  = await file.read()
+    with open(tmp_path, "wb") as f:
+        f.write(content)
+    return tmp_path
 
 
 # ─────────────────────────────────────────────
-# Direct endpoints — reads transcript from server file
+# STATUS
 # ─────────────────────────────────────────────
 
-@app.post("/transcript/process", response_model=DirectTranscriptResult)
-def process_transcript():
-    """Read transcript from server and return full result (titles + summaries + segments)."""
-    segments = run_pipeline(_read_transcript(), _get_api_key(), GROQ_MODEL)
-    return DirectTranscriptResult(segments=[SegmentOut(**s) for s in _segments_to_dicts(segments)])
-
-
-@app.post("/transcript/process/titles", response_model=DirectTitlesResult)
-def process_titles():
-    """Read transcript from server and return only the topic titles."""
-    segments = run_pipeline(_read_transcript(), _get_api_key(), GROQ_MODEL)
-    return DirectTitlesResult(titles=[seg.title for seg in segments])
-
-
-@app.post("/transcript/process/segments", response_model=DirectSegmentsResult)
-def process_segments():
-    """Read transcript from server and return only the segment texts."""
-    segments = run_pipeline(_read_transcript(), _get_api_key(), GROQ_MODEL)
-    return DirectSegmentsResult(
-        segments=[
-            {"index": seg.index, "title": seg.title, "text": seg.text}
-            for seg in segments
-        ]
+@app.get("/status", response_model=StatusResponse)
+def get_status():
+    """Check which pipeline output files exist on the server."""
+    return StatusResponse(
+        transcript=TRANSCRIPT_FILE.exists(),
+        segments=SEGMENTS_FILE.exists(),
+        description=DESCRIPTION_FILE.exists(),
     )
 
 
-@app.post("/transcript/process/summaries", response_model=DirectSummariesResult)
-def process_summaries():
-    """Read transcript from server and return only the summaries."""
-    segments = run_pipeline(_read_transcript(), _get_api_key(), GROQ_MODEL)
-    return DirectSummariesResult(
+# ─────────────────────────────────────────────
+# TRANSCRIPTION
+# ─────────────────────────────────────────────
+
+@app.post("/transcribe/video", response_model=TranscribeResponse)
+async def transcribe_video(file: UploadFile = File(...)):
+    """
+    Upload a video file, extract its audio, and transcribe it.
+    Saves transcript.txt and returns the transcript.
+    """
+    tmp_path = await _save_upload(file)
+    tmp_dir  = os.path.dirname(tmp_path)
+    try:
+        transcript = transcribe_from_video(tmp_path, _client())
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    _save_transcript(transcript)
+    return TranscribeResponse(transcript=transcript)
+
+
+@app.post("/transcribe/youtube", response_model=TranscribeResponse)
+def transcribe_youtube(body: YoutubeRequest):
+    """
+    Provide a YouTube URL, download its audio, and transcribe it.
+    Saves transcript.txt and returns the transcript.
+    """
+    transcript = transcribe_from_youtube(body.url, _client())
+    _save_transcript(transcript)
+    return TranscribeResponse(transcript=transcript)
+
+
+@app.get("/transcript", response_model=TranscribeResponse)
+def get_transcript():
+    """Get the saved transcript.txt content."""
+    _require_file(TRANSCRIPT_FILE, "Run POST /transcribe/video or /transcribe/youtube first.")
+    return TranscribeResponse(transcript=TRANSCRIPT_FILE.read_text(encoding="utf-8"))
+
+
+# ─────────────────────────────────────────────
+# SEGMENTATION
+# ─────────────────────────────────────────────
+
+@app.post("/segment", response_model=SegmentResponse)
+def segment():
+    """
+    Segment transcript.txt by topic.
+    Saves segments.json and returns all segments.
+    """
+    _require_file(TRANSCRIPT_FILE, "Run POST /transcribe/video or /transcribe/youtube first.")
+    transcript = TRANSCRIPT_FILE.read_text(encoding="utf-8")
+    segments   = segment_transcript(transcript, _client())
+    _save_segments(segments)
+    return SegmentResponse(segments=_to_segment_out(segments))
+
+
+@app.post("/segment/titles", response_model=TitlesResponse)
+def segment_titles():
+    """Segment transcript.txt and return only the topic titles."""
+    _require_file(TRANSCRIPT_FILE, "Run POST /transcribe/video or /transcribe/youtube first.")
+    transcript = TRANSCRIPT_FILE.read_text(encoding="utf-8")
+    segments   = segment_transcript(transcript, _client())
+    _save_segments(segments)
+    return TitlesResponse(titles=[seg["title"] for seg in segments])
+
+
+@app.post("/segment/summaries", response_model=SummariesResponse)
+def segment_summaries():
+    """Segment transcript.txt and return only the summaries."""
+    _require_file(TRANSCRIPT_FILE, "Run POST /transcribe/video or /transcribe/youtube first.")
+    transcript = TRANSCRIPT_FILE.read_text(encoding="utf-8")
+    segments   = segment_transcript(transcript, _client())
+    _save_segments(segments)
+    return SummariesResponse(
         summaries=[
-            {"index": seg.index, "title": seg.title, "summary": seg.summary}
+            {"index": seg["index"], "title": seg["title"], "summary": seg["summary"]}
             for seg in segments
         ]
     )
 
 
+@app.get("/segments", response_model=SegmentResponse)
+def get_segments():
+    """Get the saved segments.json content."""
+    _require_file(SEGMENTS_FILE, "Run POST /segment first.")
+    data = json.loads(SEGMENTS_FILE.read_text(encoding="utf-8"))
+    return SegmentResponse(segments=[SegmentOut(**s) for s in data])
+
+
 # ─────────────────────────────────────────────
-# Job-based endpoints — returns job_id
+# DESCRIPTION
 # ─────────────────────────────────────────────
 
-@app.post("/transcript", response_model=SubmitResponse, status_code=202)
-def submit_transcript():
-    """Read transcript from server, process it, and return a job_id for the GET endpoints."""
-    job_id = str(uuid.uuid4())
-    store[job_id] = {"status": "processing", "segments": []}
+@app.post("/describe", response_model=DescribeResponse)
+def describe():
+    """
+    Generate content description from segments.json.
+    Saves content_description.json and returns the description.
+    """
+    _require_file(SEGMENTS_FILE, "Run POST /segment first.")
+    segments    = json.loads(SEGMENTS_FILE.read_text(encoding="utf-8"))
+    client      = _client()
+    description = generate_description(build_segments_summary(segments), client)
+    _save_description(description)
+    return DescribeResponse(**description)
+
+
+@app.get("/describe", response_model=DescribeResponse)
+def get_description():
+    """Get the saved content_description.json content."""
+    _require_file(DESCRIPTION_FILE, "Run POST /describe first.")
+    return DescribeResponse(**json.loads(DESCRIPTION_FILE.read_text(encoding="utf-8")))
+
+
+# ─────────────────────────────────────────────
+# FULL PIPELINE
+# ─────────────────────────────────────────────
+
+@app.post("/pipeline/video", response_model=PipelineResponse)
+async def pipeline_video(file: UploadFile = File(...)):
+    """
+    Upload a video file and run the full pipeline:
+      1. Extract audio + transcribe → transcript.txt
+      2. Segment → segments.json
+      3. Describe → content_description.json
+    Returns everything.
+    """
+    client   = _client()
+    tmp_path = await _save_upload(file)
+    tmp_dir  = os.path.dirname(tmp_path)
 
     try:
-        segments = run_pipeline(_read_transcript(), _get_api_key(), GROQ_MODEL)
-        store[job_id] = {"status": "done", "segments": _segments_to_dicts(segments)}
-    except Exception as e:
-        store[job_id] = {"status": "error", "segments": [], "error": str(e)}
-        raise HTTPException(status_code=500, detail=str(e))
+        transcript = transcribe_from_video(tmp_path, client)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    return SubmitResponse(job_id=job_id, message="Processing complete.")
+    _save_transcript(transcript)
 
+    segments = segment_transcript(transcript, client)
+    _save_segments(segments)
 
-@app.get("/transcript/{job_id}", response_model=TranscriptResult)
-def get_transcript(job_id: str):
-    """Full result — titles, summaries, and segment texts."""
-    job = _get_job(job_id)
-    return TranscriptResult(
-        job_id=job_id,
-        status=job["status"],
-        segments=[SegmentOut(**s) for s in job["segments"]],
-        error=job.get("error"),
+    description = generate_description(build_segments_summary(segments), client)
+    _save_description(description)
+
+    return PipelineResponse(
+        transcript=transcript,
+        segments=_to_segment_out(segments),
+        description=DescribeResponse(**description),
     )
 
 
-@app.get("/transcript/{job_id}/titles", response_model=TitlesResult)
-def get_titles(job_id: str):
-    """Only the topic titles, in order."""
-    job = _get_job(job_id)
-    return TitlesResult(job_id=job_id, titles=[s["title"] for s in job["segments"]])
+@app.post("/pipeline/youtube", response_model=PipelineResponse)
+def pipeline_youtube(body: YoutubeRequest):
+    """
+    Provide a YouTube URL and run the full pipeline:
+      1. Download audio + transcribe → transcript.txt
+      2. Segment → segments.json
+      3. Describe → content_description.json
+    Returns everything.
+    """
+    client     = _client()
+    transcript = transcribe_from_youtube(body.url, client)
+    _save_transcript(transcript)
 
+    segments = segment_transcript(transcript, client)
+    _save_segments(segments)
 
-@app.get("/transcript/{job_id}/segments", response_model=SegmentsResult)
-def get_segments(job_id: str):
-    """Only the segment texts."""
-    job = _get_job(job_id)
-    return SegmentsResult(
-        job_id=job_id,
-        segments=[
-            {"index": s["index"], "title": s["title"], "text": s["text"]}
-            for s in job["segments"]
-        ],
-    )
+    description = generate_description(build_segments_summary(segments), client)
+    _save_description(description)
 
-
-@app.get("/transcript/{job_id}/summaries", response_model=SummariesResult)
-def get_summaries(job_id: str):
-    """Only the summaries."""
-    job = _get_job(job_id)
-    return SummariesResult(
-        job_id=job_id,
-        summaries=[
-            {"index": s["index"], "title": s["title"], "summary": s["summary"]}
-            for s in job["segments"]
-        ],
+    return PipelineResponse(
+        transcript=transcript,
+        segments=_to_segment_out(segments),
+        description=DescribeResponse(**description),
     )
