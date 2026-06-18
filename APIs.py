@@ -1,29 +1,33 @@
 """
-api.py — Full Pipeline REST API
-=================================
+api.py — Full Pipeline REST API  (MongoDB edition)
+====================================================
 Endpoints:
 
   STATUS
-    GET  /status                      — check which files exist on server
+    GET  /status                      — check pipeline state in MongoDB
 
   TRANSCRIPTION
-    POST /transcribe/video            — upload a video file → transcript.txt → return transcript
-    POST /transcribe/youtube          — provide YouTube URL → transcript.txt → return transcript
-    GET  /transcript                  — get saved transcript.txt
+    POST /transcribe/video            — upload a video file → transcript → save to MongoDB
+    POST /transcribe/youtube          — provide YouTube URL → transcript → save to MongoDB
+    GET  /transcript                  — get latest transcript from MongoDB
 
   SEGMENTATION
-    POST /segment                     — segment transcript.txt → segments.json → return segments
+    POST /segment                     — segment latest transcript → save to MongoDB
     POST /segment/titles              — segment → return titles only
     POST /segment/summaries           — segment → return summaries only
-    GET  /segments                    — get saved segments.json
+    GET  /segments                    — get latest segments from MongoDB
 
   DESCRIPTION
-    POST /describe                    — describe segments.json → content_description.json → return description
-    GET  /describe                    — get saved content_description.json
+    POST /describe                    — describe latest segments → save to MongoDB
+    GET  /describe                    — get latest description from MongoDB
 
   FULL PIPELINE
-    POST /pipeline/video              — upload video → all 3 steps → return full result
-    POST /pipeline/youtube            — YouTube URL → all 3 steps → return full result
+    POST /pipeline/video              — upload video → all 3 steps → save to MongoDB
+    POST /pipeline/youtube            — YouTube URL → all 3 steps → save to MongoDB
+
+  HISTORY
+    GET  /runs                        — list recent pipeline runs (metadata only)
+    GET  /runs/{run_id}               — get a specific run by ID
 
 Run:
   uvicorn api:app --reload
@@ -31,7 +35,6 @@ Run:
 
 import os
 import json
-import time
 import tempfile
 import shutil
 from pathlib import Path
@@ -45,7 +48,8 @@ from groq import Groq
 
 from transcriber import transcribe_from_video, transcribe_from_youtube
 from segmenter   import segment_transcript
-from describer  import build_segments_summary, generate_description
+from describer   import build_segments_summary, generate_description
+import database as db
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -54,11 +58,7 @@ load_dotenv(Path(__file__).parent / ".env")
 # CONFIG
 # ─────────────────────────────────────────────
 
-GROQ_MODEL       = "llama-3.3-70b-versatile"
-DIR              = Path(__file__).parent
-TRANSCRIPT_FILE  = DIR / "transcript.txt"
-SEGMENTS_FILE    = DIR / "segments.json"
-DESCRIPTION_FILE = DIR / "content_description.json"
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 
 # ─────────────────────────────────────────────
@@ -99,6 +99,7 @@ class DescribeResponse(BaseModel):
     seo_tags: list[str]
 
 class PipelineResponse(BaseModel):
+    run_id: str
     transcript: str
     segments: list[SegmentOut]
     description: DescribeResponse
@@ -110,8 +111,8 @@ class PipelineResponse(BaseModel):
 
 app = FastAPI(
     title="Video Pipeline API",
-    description="Full pipeline: video/YouTube → transcribe → segment → describe.",
-    version="4.0.0",
+    description="Full pipeline: video/YouTube → transcribe → segment → describe. Outputs stored in MongoDB.",
+    version="5.0.0",
 )
 
 app.add_middleware(
@@ -143,23 +144,6 @@ def _client() -> Groq:
     return Groq(api_key=key)
 
 
-def _require_file(path: Path, hint: str) -> None:
-    if not path.exists():
-        raise HTTPException(status_code=404, detail=f"{path.name} not found. {hint}")
-
-
-def _save_transcript(transcript: str) -> None:
-    TRANSCRIPT_FILE.write_text(transcript, encoding="utf-8")
-
-
-def _save_segments(segments: list[dict]) -> None:
-    SEGMENTS_FILE.write_text(json.dumps(segments, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _save_description(description: dict) -> None:
-    DESCRIPTION_FILE.write_text(json.dumps(description, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 def _to_segment_out(segments: list[dict]) -> list[SegmentOut]:
     return [SegmentOut(**seg) for seg in segments]
 
@@ -174,18 +158,34 @@ async def _save_upload(file: UploadFile) -> str:
     return tmp_path
 
 
+def _require_transcript() -> str:
+    transcript = db.get_transcript()
+    if not transcript:
+        raise HTTPException(
+            status_code=404,
+            detail="No transcript found in MongoDB. Run POST /transcribe/video or /transcribe/youtube first.",
+        )
+    return transcript
+
+
+def _require_segments() -> list:
+    segments = db.get_segments()
+    if not segments:
+        raise HTTPException(
+            status_code=404,
+            detail="No segments found in MongoDB. Run POST /segment first.",
+        )
+    return segments
+
+
 # ─────────────────────────────────────────────
 # STATUS
 # ─────────────────────────────────────────────
 
 @app.get("/status", response_model=StatusResponse)
 def get_status():
-    """Check which pipeline output files exist on the server."""
-    return StatusResponse(
-        transcript=TRANSCRIPT_FILE.exists(),
-        segments=SEGMENTS_FILE.exists(),
-        description=DESCRIPTION_FILE.exists(),
-    )
+    """Check which pipeline stages have been completed (based on latest run in MongoDB)."""
+    return StatusResponse(**db.status())
 
 
 # ─────────────────────────────────────────────
@@ -195,9 +195,9 @@ def get_status():
 @app.post("/transcribe/video", response_model=TranscribeResponse)
 async def transcribe_video(file: UploadFile = File(...)):
     """
-    Upload a video file, extract its audio, and transcribe it.
-    Saves transcript.txt and returns the transcript.
+    Upload a video file, extract its audio, transcribe it, and save to MongoDB.
     """
+    run_id   = db.new_run("video", file.filename)
     tmp_path = await _save_upload(file)
     tmp_dir  = os.path.dirname(tmp_path)
     try:
@@ -205,26 +205,25 @@ async def transcribe_video(file: UploadFile = File(...)):
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    _save_transcript(transcript)
+    db.save_transcript(transcript, run_id)
     return TranscribeResponse(transcript=transcript)
 
 
 @app.post("/transcribe/youtube", response_model=TranscribeResponse)
 def transcribe_youtube(body: YoutubeRequest):
     """
-    Provide a YouTube URL, download its audio, and transcribe it.
-    Saves transcript.txt and returns the transcript.
+    Provide a YouTube URL, download its audio, transcribe it, and save to MongoDB.
     """
+    run_id     = db.new_run("youtube", body.url)
     transcript = transcribe_from_youtube(body.url, _client())
-    _save_transcript(transcript)
+    db.save_transcript(transcript, run_id)
     return TranscribeResponse(transcript=transcript)
 
 
 @app.get("/transcript", response_model=TranscribeResponse)
 def get_transcript():
-    """Get the saved transcript.txt content."""
-    _require_file(TRANSCRIPT_FILE, "Run POST /transcribe/video or /transcribe/youtube first.")
-    return TranscribeResponse(transcript=TRANSCRIPT_FILE.read_text(encoding="utf-8"))
+    """Get the latest transcript from MongoDB."""
+    return TranscribeResponse(transcript=_require_transcript())
 
 
 # ─────────────────────────────────────────────
@@ -234,33 +233,29 @@ def get_transcript():
 @app.post("/segment", response_model=SegmentResponse)
 def segment():
     """
-    Segment transcript.txt by topic.
-    Saves segments.json and returns all segments.
+    Segment the latest transcript from MongoDB, save segments back to MongoDB.
     """
-    _require_file(TRANSCRIPT_FILE, "Run POST /transcribe/video or /transcribe/youtube first.")
-    transcript = TRANSCRIPT_FILE.read_text(encoding="utf-8")
+    transcript = _require_transcript()
     segments   = segment_transcript(transcript, _client())
-    _save_segments(segments)
+    db.save_segments(segments)          # updates the latest run
     return SegmentResponse(segments=_to_segment_out(segments))
 
 
 @app.post("/segment/titles", response_model=TitlesResponse)
 def segment_titles():
-    """Segment transcript.txt and return only the topic titles."""
-    _require_file(TRANSCRIPT_FILE, "Run POST /transcribe/video or /transcribe/youtube first.")
-    transcript = TRANSCRIPT_FILE.read_text(encoding="utf-8")
+    """Segment the latest transcript and return only the topic titles."""
+    transcript = _require_transcript()
     segments   = segment_transcript(transcript, _client())
-    _save_segments(segments)
+    db.save_segments(segments)
     return TitlesResponse(titles=[seg["title"] for seg in segments])
 
 
 @app.post("/segment/summaries", response_model=SummariesResponse)
 def segment_summaries():
-    """Segment transcript.txt and return only the summaries."""
-    _require_file(TRANSCRIPT_FILE, "Run POST /transcribe/video or /transcribe/youtube first.")
-    transcript = TRANSCRIPT_FILE.read_text(encoding="utf-8")
+    """Segment the latest transcript and return only the summaries."""
+    transcript = _require_transcript()
     segments   = segment_transcript(transcript, _client())
-    _save_segments(segments)
+    db.save_segments(segments)
     return SummariesResponse(
         summaries=[
             {"index": seg["index"], "title": seg["title"], "summary": seg["summary"]}
@@ -271,10 +266,9 @@ def segment_summaries():
 
 @app.get("/segments", response_model=SegmentResponse)
 def get_segments():
-    """Get the saved segments.json content."""
-    _require_file(SEGMENTS_FILE, "Run POST /segment first.")
-    data = json.loads(SEGMENTS_FILE.read_text(encoding="utf-8"))
-    return SegmentResponse(segments=[SegmentOut(**s) for s in data])
+    """Get the latest segments from MongoDB."""
+    segments = _require_segments()
+    return SegmentResponse(segments=_to_segment_out(segments))
 
 
 # ─────────────────────────────────────────────
@@ -284,22 +278,26 @@ def get_segments():
 @app.post("/describe", response_model=DescribeResponse)
 def describe():
     """
-    Generate content description from segments.json.
-    Saves content_description.json and returns the description.
+    Generate content description from the latest segments in MongoDB,
+    and save the description back to MongoDB.
     """
-    _require_file(SEGMENTS_FILE, "Run POST /segment first.")
-    segments    = json.loads(SEGMENTS_FILE.read_text(encoding="utf-8"))
+    segments    = _require_segments()
     client      = _client()
     description = generate_description(build_segments_summary(segments), client)
-    _save_description(description)
+    db.save_description(description)
     return DescribeResponse(**description)
 
 
 @app.get("/describe", response_model=DescribeResponse)
 def get_description():
-    """Get the saved content_description.json content."""
-    _require_file(DESCRIPTION_FILE, "Run POST /describe first.")
-    return DescribeResponse(**json.loads(DESCRIPTION_FILE.read_text(encoding="utf-8")))
+    """Get the latest content description from MongoDB."""
+    description = db.get_description()
+    if not description:
+        raise HTTPException(
+            status_code=404,
+            detail="No description found in MongoDB. Run POST /describe first.",
+        )
+    return DescribeResponse(**description)
 
 
 # ─────────────────────────────────────────────
@@ -310,12 +308,13 @@ def get_description():
 async def pipeline_video(file: UploadFile = File(...)):
     """
     Upload a video file and run the full pipeline:
-      1. Extract audio + transcribe → transcript.txt
-      2. Segment → segments.json
-      3. Describe → content_description.json
-    Returns everything.
+      1. Extract audio + transcribe
+      2. Segment
+      3. Describe
+    Everything is saved to a single MongoDB document. Returns run_id + all results.
     """
     client   = _client()
+    run_id   = db.new_run("video", file.filename)
     tmp_path = await _save_upload(file)
     tmp_dir  = os.path.dirname(tmp_path)
 
@@ -324,15 +323,16 @@ async def pipeline_video(file: UploadFile = File(...)):
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    _save_transcript(transcript)
+    db.save_transcript(transcript, run_id)
 
     segments = segment_transcript(transcript, client)
-    _save_segments(segments)
+    db.save_segments(segments, run_id)
 
     description = generate_description(build_segments_summary(segments), client)
-    _save_description(description)
+    db.save_description(description, run_id)
 
     return PipelineResponse(
+        run_id=run_id,
         transcript=transcript,
         segments=_to_segment_out(segments),
         description=DescribeResponse(**description),
@@ -343,23 +343,45 @@ async def pipeline_video(file: UploadFile = File(...)):
 def pipeline_youtube(body: YoutubeRequest):
     """
     Provide a YouTube URL and run the full pipeline:
-      1. Download audio + transcribe → transcript.txt
-      2. Segment → segments.json
-      3. Describe → content_description.json
-    Returns everything.
+      1. Download audio + transcribe
+      2. Segment
+      3. Describe
+    Everything is saved to a single MongoDB document. Returns run_id + all results.
     """
     client     = _client()
+    run_id     = db.new_run("youtube", body.url)
     transcript = transcribe_from_youtube(body.url, client)
-    _save_transcript(transcript)
+    db.save_transcript(transcript, run_id)
 
     segments = segment_transcript(transcript, client)
-    _save_segments(segments)
+    db.save_segments(segments, run_id)
 
     description = generate_description(build_segments_summary(segments), client)
-    _save_description(description)
+    db.save_description(description, run_id)
 
     return PipelineResponse(
+        run_id=run_id,
         transcript=transcript,
         segments=_to_segment_out(segments),
         description=DescribeResponse(**description),
     )
+
+
+# ─────────────────────────────────────────────
+# HISTORY
+# ─────────────────────────────────────────────
+
+@app.get("/runs")
+def list_runs(limit: int = 20):
+    """List the most recent pipeline runs (metadata only, no transcript text)."""
+    return db.list_runs(limit=limit)
+
+
+@app.get("/runs/{run_id}")
+def get_run(run_id: str):
+    """Fetch a specific pipeline run by its run_id."""
+    run = db.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+    run.pop("_id", None)    # remove non-serialisable ObjectId
+    return run
