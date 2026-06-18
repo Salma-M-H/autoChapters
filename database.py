@@ -39,12 +39,6 @@ load_dotenv(Path(__file__).parent / ".env")
 # CONFIG
 # ─────────────────────────────────────────────
 
-MONGO_URI   = os.getenv(
-    "MONGO_URI",
-    "mongodb+srv://salmahasa310_db_user:avCyxkzmeJRhRNTd@cluster0.xpc7iik.mongodb.net/?appName=Cluster0",
-)
-DB_NAME         = os.getenv("MONGO_DB_NAME",         "video_pipeline")
-COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "pipeline_runs")
 
 
 # ─────────────────────────────────────────────
