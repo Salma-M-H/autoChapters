@@ -39,6 +39,9 @@ load_dotenv(Path(__file__).parent / ".env")
 # CONFIG
 # ─────────────────────────────────────────────
 
+MONGO_URI   = os.getenv("MONGO_URI")
+DB_NAME         = os.getenv("MONGO_DB_NAME")
+COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME")
 
 
 # ─────────────────────────────────────────────
