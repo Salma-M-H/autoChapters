@@ -3,6 +3,7 @@
 transcribe.py  —  Step 1 of 3
 ==============================
 Extracts audio from a video file and transcribes it using Groq Whisper.
+Audio chunks are transcribed in parallel using ThreadPoolExecutor.
 
 Output:
     transcript.txt   — every line is:  [HH:MM:SS] spoken text
@@ -19,6 +20,7 @@ import tempfile
 import shutil
 import subprocess
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
@@ -37,9 +39,10 @@ OUTPUT_FILE  = "transcript.txt"
 FFMPEG_PATH  = os.getenv("FFMPEG_PATH",  "ffmpeg")
 FFPROBE_PATH = os.getenv("FFPROBE_PATH", "ffprobe")
 
-MAX_RETRIES  = 5    # retries per chunk on connection error
-RETRY_DELAY  = 5    # seconds before first retry (doubles each attempt)
-MAX_CHUNK_MB = 15   # max MB per audio chunk (Groq Whisper limit is 25 MB)
+MAX_RETRIES      = 5     # retries per chunk on connection error
+RETRY_DELAY      = 5     # seconds before first retry (doubles each attempt)
+MAX_CHUNK_MB     = 20    # raised from 15 → closer to Groq's 25 MB limit = fewer chunks
+MAX_WORKERS      = 3     # parallel Groq Whisper requests
 
 # ============================================================
 
@@ -140,33 +143,25 @@ def chunk_audio_preserve_timing(audio_path: str) -> list[tuple[AudioSegment, flo
     chunks = []
     pos_ms = 0
 
-    # Walk through audio in target_chunk_ms steps.
-    # For each step find the nearest silence boundary to cut at.
-    # Stop only when the next cut would be at or beyond the end.
     while pos_ms < total_ms:
         target_end = pos_ms + target_chunk_ms
 
         if target_end >= total_ms:
-            # Remaining audio fits in one chunk — take everything to the end
             chunks.append((audio[pos_ms:total_ms], pos_ms / 1000))
             pos_ms = total_ms
             break
 
-        # Find quietest point near target_end — cut there, keep all audio
         cut_ms = find_silence_boundary(audio, target_end)
 
-        # Safety: never cut before or at current position
         if cut_ms <= pos_ms:
             cut_ms = target_end
 
-        # Safety: never cut beyond total audio length
         cut_ms = min(cut_ms, total_ms)
 
         chunks.append((audio[pos_ms:cut_ms], pos_ms / 1000))
         pos_ms = cut_ms
 
     # Final safety net: verify last chunk reaches the very end of the audio.
-    # If there is any remaining audio (even 1ms), append it.
     if chunks:
         last_chunk, last_start_s = chunks[-1]
         last_end_ms = int(last_start_s * 1000) + len(last_chunk)
@@ -198,53 +193,76 @@ def transcribe_chunk_with_retry(chunk_path: str, client) -> object:
             delay *= 2
 
 
+def _process_chunk(args: tuple) -> tuple[int, object, float]:
+    """
+    Worker function for parallel transcription.
+    Exports one chunk to a temp MP3, calls Groq Whisper, returns (index, transcription, start_seconds).
+    Each worker gets its own tmp file so there are no path collisions.
+    """
+    i, chunk, start_seconds, client, tmp_dir = args
+    chunk_path = os.path.join(tmp_dir, f"chunk_{i}.mp3")
+    chunk.export(chunk_path, format="mp3")
+    print(f"      Chunk {i + 1}: starts at {format_timestamp(start_seconds)}, "
+          f"{len(chunk) / 1000:.0f}s — transcribing...", flush=True)
+    transcription = transcribe_chunk_with_retry(chunk_path, client)
+    print(f"      Chunk {i + 1}: done.")
+    return i, transcription, start_seconds
+
+
 def transcribe(audio_path: str, client) -> str:
     """
     Transcribe the audio and return the full transcript as a string.
+    Chunks are transcribed in parallel (MAX_WORKERS threads).
     Each line: [HH:MM:SS] spoken text
     """
     print("[2/2] Transcribing with Groq Whisper...")
 
     audio_chunks = chunk_audio_preserve_timing(audio_path)
-
-    lines   = []
-    tmp_dir = tempfile.mkdtemp()
+    total        = len(audio_chunks)
+    results      = {}
+    tmp_dir      = tempfile.mkdtemp()
 
     try:
-        for i, (chunk, start_seconds) in enumerate(audio_chunks):
-            duration_s = len(chunk) / 1000
-            print(f"      Chunk {i + 1}/{len(audio_chunks)}: "
-                  f"starts at {format_timestamp(start_seconds)}, "
-                  f"{duration_s:.0f}s...",
-                  end="", flush=True)
-
-            chunk_path = os.path.join(tmp_dir, f"chunk_{i}.mp3")
-            chunk.export(chunk_path, format="mp3")
-
-            transcription = transcribe_chunk_with_retry(chunk_path, client)
-
-            for seg in transcription.segments:
-                # seg.start is relative to the chunk — add start_seconds for real video time
-                seg_start = seg["start"] if isinstance(seg, dict) else seg.start
-                seg_text  = seg["text"]  if isinstance(seg, dict) else seg.text
-                real_time = seg_start + start_seconds
-                lines.append(f"[{format_timestamp(real_time)}] {seg_text.strip()}")
-
-            print(" done.")
+        if total == 1:
+            # Single chunk — no need for a thread pool
+            chunk, start_seconds = audio_chunks[0]
+            _, transcription, start_seconds = _process_chunk(
+                (0, chunk, start_seconds, client, tmp_dir)
+            )
+            results[0] = (transcription, start_seconds)
+        else:
+            print(f"      Transcribing {total} chunks in parallel (max {MAX_WORKERS} workers)...")
+            task_args = [
+                (i, chunk, start_s, client, tmp_dir)
+                for i, (chunk, start_s) in enumerate(audio_chunks)
+            ]
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = {executor.submit(_process_chunk, args): args[0] for args in task_args}
+                for future in as_completed(futures):
+                    i, transcription, start_seconds = future.result()
+                    results[i] = (transcription, start_seconds)
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    # Reassemble in original order
+    lines = []
+    for i in sorted(results):
+        transcription, start_seconds = results[i]
+        for seg in transcription.segments:
+            seg_start = seg["start"] if isinstance(seg, dict) else seg.start
+            seg_text  = seg["text"]  if isinstance(seg, dict) else seg.text
+            real_time = seg_start + start_seconds
+            lines.append(f"[{format_timestamp(real_time)}] {seg_text.strip()}")
+
     print(f"      Transcription complete: {len(lines)} lines.")
     return "\n".join(lines)
-
 
 
 def download_audio_from_youtube(url: str, output_path: str) -> None:
     """Download audio from a YouTube URL and save as MP3 using yt-dlp."""
     print(f"[1/2] Downloading audio from YouTube: {url}")
 
-    # Get ffmpeg directory from FFMPEG_PATH env var (yt-dlp needs the folder, not the binary)
     ffmpeg_dir = str(Path(FFMPEG_PATH).parent) if FFMPEG_PATH != "ffmpeg" else None
 
     cmd = [
