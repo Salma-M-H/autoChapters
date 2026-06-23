@@ -7,8 +7,8 @@ Endpoints:
     GET  /status                      — check pipeline state in MongoDB
 
   TRANSCRIPTION
-    POST /transcribe/video            — upload a video file → transcript → save to MongoDB
-    POST /transcribe/youtube          — provide YouTube URL → transcript → save to MongoDB
+    POST /transcribe/video            — upload a video file → starts background job → returns run_id
+    POST /transcribe/youtube          — provide YouTube URL → starts background job → returns run_id
     GET  /transcript                  — get latest transcript from MongoDB
 
   SEGMENTATION
@@ -22,26 +22,28 @@ Endpoints:
     GET  /describe                    — get latest description from MongoDB
 
   FULL PIPELINE
-    POST /pipeline/video              — upload video → all 3 steps → save to MongoDB
-    POST /pipeline/youtube            — YouTube URL → all 3 steps → save to MongoDB
+    POST /pipeline/video              — upload video → starts background job → returns run_id
+    POST /pipeline/youtube            — YouTube URL → starts background job → returns run_id
 
   HISTORY
     GET  /runs                        — list recent pipeline runs (metadata only)
-    GET  /runs/{run_id}               — get a specific run by ID
+    GET  /runs/{run_id}               — get a specific run by ID (poll this for job status)
+
+NOTE: Long-running endpoints (transcribe, pipeline) return immediately with a run_id
+      and status="processing". Poll GET /runs/{run_id} until status is "done" or "error".
 
 Run:
   uvicorn api:app --reload
 """
 
 import os
-import json
 import tempfile
 import shutil
 from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from groq import Groq
@@ -84,6 +86,11 @@ class StatusResponse(BaseModel):
 class TranscribeResponse(BaseModel):
     transcript: str
 
+class AsyncJobResponse(BaseModel):
+    run_id: str
+    status: str          # "processing" | "done" | "error"
+    message: str
+
 class SegmentResponse(BaseModel):
     segments: list[SegmentOut]
 
@@ -111,8 +118,12 @@ class PipelineResponse(BaseModel):
 
 app = FastAPI(
     title="Video Pipeline API",
-    description="Full pipeline: video/YouTube → transcribe → segment → describe. Outputs stored in MongoDB.",
-    version="5.0.0",
+    description=(
+        "Full pipeline: video/YouTube → transcribe → segment → describe. "
+        "Outputs stored in MongoDB. Long-running jobs return immediately with a "
+        "run_id — poll GET /runs/{run_id} until status is 'done'."
+    ),
+    version="6.0.0",
 )
 
 app.add_middleware(
@@ -169,6 +180,72 @@ def _require_segments() -> list:
 
 
 # ─────────────────────────────────────────────
+# Background task workers
+# ─────────────────────────────────────────────
+
+def _bg_transcribe_video(run_id: str, tmp_path: str, tmp_dir: str) -> None:
+    """Background worker: transcribe a local video file and save to MongoDB."""
+    try:
+        client     = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        transcript = transcribe_from_video(tmp_path, client)
+        db.save_transcript(transcript, run_id)
+        db.update_run_status(run_id, "done")
+    except Exception as e:
+        db.update_run_status(run_id, "error", str(e))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _bg_transcribe_youtube(run_id: str, url: str) -> None:
+    """Background worker: download + transcribe a YouTube URL and save to MongoDB."""
+    try:
+        client     = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        transcript = transcribe_from_youtube(url, client)
+        db.save_transcript(transcript, run_id)
+        db.update_run_status(run_id, "done")
+    except Exception as e:
+        db.update_run_status(run_id, "error", str(e))
+
+
+def _bg_pipeline_video(run_id: str, tmp_path: str, tmp_dir: str) -> None:
+    """Background worker: full pipeline (transcribe → segment → describe) for a local video."""
+    try:
+        client     = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        transcript = transcribe_from_video(tmp_path, client)
+        db.save_transcript(transcript, run_id)
+
+        segments = segment_transcript(transcript, client)
+        db.save_segments(segments, run_id)
+
+        description = generate_description(build_segments_summary(segments), client)
+        db.save_description(description, run_id)
+
+        db.update_run_status(run_id, "done")
+    except Exception as e:
+        db.update_run_status(run_id, "error", str(e))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _bg_pipeline_youtube(run_id: str, url: str) -> None:
+    """Background worker: full pipeline (transcribe → segment → describe) for a YouTube URL."""
+    try:
+        client     = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        transcript = transcribe_from_youtube(url, client)
+        db.save_transcript(transcript, run_id)
+
+        segments = segment_transcript(transcript, client)
+        db.save_segments(segments, run_id)
+
+        description = generate_description(build_segments_summary(segments), client)
+        db.save_description(description, run_id)
+
+        db.update_run_status(run_id, "done")
+    except Exception as e:
+        db.update_run_status(run_id, "error", str(e))
+
+
+# ─────────────────────────────────────────────
 # STATUS
 # ─────────────────────────────────────────────
 
@@ -182,32 +259,42 @@ def get_status():
 # TRANSCRIPTION
 # ─────────────────────────────────────────────
 
-@app.post("/transcribe/video", response_model=TranscribeResponse)
-async def transcribe_video(file: UploadFile = File(...)):
+@app.post("/transcribe/video", response_model=AsyncJobResponse)
+async def transcribe_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     """
-    Upload a video file, extract its audio, transcribe it, and save to MongoDB.
+    Upload a video file and start transcription in the background.
+    Returns immediately with a run_id. Poll GET /runs/{run_id} for progress.
+    Status will be "processing" → "done" (or "error").
     """
     run_id   = db.new_run("video", file.filename)
     tmp_path = await _save_upload(file)
     tmp_dir  = os.path.dirname(tmp_path)
-    try:
-        transcript = transcribe_from_video(tmp_path, _client())
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    db.save_transcript(transcript, run_id)
-    return TranscribeResponse(transcript=transcript)
+    background_tasks.add_task(_bg_transcribe_video, run_id, tmp_path, tmp_dir)
+
+    return AsyncJobResponse(
+        run_id=run_id,
+        status="processing",
+        message=f"Transcription started. Poll GET /runs/{run_id} for status.",
+    )
 
 
-@app.post("/transcribe/youtube", response_model=TranscribeResponse)
-def transcribe_youtube(body: YoutubeRequest):
+@app.post("/transcribe/youtube", response_model=AsyncJobResponse)
+async def transcribe_youtube(background_tasks: BackgroundTasks, body: YoutubeRequest):
     """
-    Provide a YouTube URL, download its audio, transcribe it, and save to MongoDB.
+    Provide a YouTube URL and start transcription in the background.
+    Returns immediately with a run_id. Poll GET /runs/{run_id} for progress.
+    Status will be "processing" → "done" (or "error").
     """
-    run_id     = db.new_run("youtube", body.url)
-    transcript = transcribe_from_youtube(body.url, _client())
-    db.save_transcript(transcript, run_id)
-    return TranscribeResponse(transcript=transcript)
+    run_id = db.new_run("youtube", body.url)
+
+    background_tasks.add_task(_bg_transcribe_youtube, run_id, body.url)
+
+    return AsyncJobResponse(
+        run_id=run_id,
+        status="processing",
+        message=f"Transcription started. Poll GET /runs/{run_id} for status.",
+    )
 
 
 @app.get("/transcript", response_model=TranscribeResponse)
@@ -227,7 +314,7 @@ def segment():
     """
     transcript = _require_transcript()
     segments   = segment_transcript(transcript, _client())
-    db.save_segments(segments)          # updates the latest run
+    db.save_segments(segments)
     return SegmentResponse(segments=_to_segment_out(segments))
 
 
@@ -294,66 +381,49 @@ def get_description():
 # FULL PIPELINE
 # ─────────────────────────────────────────────
 
-@app.post("/pipeline/video", response_model=PipelineResponse)
-async def pipeline_video(file: UploadFile = File(...)):
+@app.post("/pipeline/video", response_model=AsyncJobResponse)
+async def pipeline_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     """
-    Upload a video file and run the full pipeline:
+    Upload a video file and run the full pipeline in the background:
       1. Extract audio + transcribe
       2. Segment
       3. Describe
-    Everything is saved to a single MongoDB document. Returns run_id + all results.
+    Returns immediately with a run_id. Poll GET /runs/{run_id} for progress.
+    Status will be "processing" → "done" (or "error").
+    When done, the full result is available at GET /runs/{run_id}.
     """
-    client   = _client()
     run_id   = db.new_run("video", file.filename)
     tmp_path = await _save_upload(file)
     tmp_dir  = os.path.dirname(tmp_path)
 
-    try:
-        transcript = transcribe_from_video(tmp_path, client)
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    background_tasks.add_task(_bg_pipeline_video, run_id, tmp_path, tmp_dir)
 
-    db.save_transcript(transcript, run_id)
-
-    segments = segment_transcript(transcript, client)
-    db.save_segments(segments, run_id)
-
-    description = generate_description(build_segments_summary(segments), client)
-    db.save_description(description, run_id)
-
-    return PipelineResponse(
+    return AsyncJobResponse(
         run_id=run_id,
-        transcript=transcript,
-        segments=_to_segment_out(segments),
-        description=DescribeResponse(**description),
+        status="processing",
+        message=f"Pipeline started. Poll GET /runs/{run_id} for status.",
     )
 
 
-@app.post("/pipeline/youtube", response_model=PipelineResponse)
-def pipeline_youtube(body: YoutubeRequest):
+@app.post("/pipeline/youtube", response_model=AsyncJobResponse)
+async def pipeline_youtube(background_tasks: BackgroundTasks, body: YoutubeRequest):
     """
-    Provide a YouTube URL and run the full pipeline:
+    Provide a YouTube URL and run the full pipeline in the background:
       1. Download audio + transcribe
       2. Segment
       3. Describe
-    Everything is saved to a single MongoDB document. Returns run_id + all results.
+    Returns immediately with a run_id. Poll GET /runs/{run_id} for progress.
+    Status will be "processing" → "done" (or "error").
+    When done, the full result is available at GET /runs/{run_id}.
     """
-    client     = _client()
-    run_id     = db.new_run("youtube", body.url)
-    transcript = transcribe_from_youtube(body.url, client)
-    db.save_transcript(transcript, run_id)
+    run_id = db.new_run("youtube", body.url)
 
-    segments = segment_transcript(transcript, client)
-    db.save_segments(segments, run_id)
+    background_tasks.add_task(_bg_pipeline_youtube, run_id, body.url)
 
-    description = generate_description(build_segments_summary(segments), client)
-    db.save_description(description, run_id)
-
-    return PipelineResponse(
+    return AsyncJobResponse(
         run_id=run_id,
-        transcript=transcript,
-        segments=_to_segment_out(segments),
-        description=DescribeResponse(**description),
+        status="processing",
+        message=f"Pipeline started. Poll GET /runs/{run_id} for status.",
     )
 
 
@@ -369,7 +439,11 @@ def list_runs(limit: int = 20):
 
 @app.get("/runs/{run_id}")
 def get_run(run_id: str):
-    """Fetch a specific pipeline run by its run_id."""
+    """
+    Fetch a specific pipeline run by its run_id.
+    Use this to poll for job completion after POST /transcribe/* or /pipeline/*.
+    Possible status values: "processing", "done", "error".
+    """
     run = db.get_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
