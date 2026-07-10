@@ -1,25 +1,25 @@
 """
-api.py — Full Pipeline REST API  (MongoDB edition)
+api.py — Full Pipeline REST API  (Local File Storage edition)
 ====================================================
 Endpoints:
 
   STATUS
-    GET  /status                      — check pipeline state in MongoDB
+    GET  /status                      — check pipeline state (local files)
 
   TRANSCRIPTION
     POST /transcribe/video            — upload a video file → starts background job → returns run_id
     POST /transcribe/youtube          — provide YouTube URL → starts background job → returns run_id
-    GET  /transcript                  — get latest transcript from MongoDB
+    GET  /transcript                  — get latest transcript from local file
 
   SEGMENTATION
-    POST /segment                     — segment latest transcript → save to MongoDB
+    POST /segment                     — segment latest transcript → save to local file
     POST /segment/titles              — segment → return titles only
     POST /segment/summaries           — segment → return summaries only
-    GET  /segments                    — get latest segments from MongoDB
+    GET  /segments                    — get latest segments from local file
 
   DESCRIPTION
-    POST /describe                    — describe latest segments → save to MongoDB
-    GET  /describe                    — get latest description from MongoDB
+    POST /describe                    — describe latest segments → save to local file
+    GET  /describe                    — get latest description from local file
 
   FULL PIPELINE
     POST /pipeline/video              — upload video → starts background job → returns run_id
@@ -51,9 +51,129 @@ from groq import Groq
 from transcriber import transcribe_from_video, transcribe_from_youtube
 from segmenter   import segment_transcript
 from describer   import build_segments_summary, generate_description
-import database as db
 
 load_dotenv(Path(__file__).parent / ".env")
+
+
+# ─────────────────────────────────────────────
+# Local file storage (replaces MongoDB)
+# ─────────────────────────────────────────────
+# The pipeline outputs are saved as plain files in this same folder,
+# exactly like the original standalone scripts did:
+#   transcript.txt            (from transcriber.py)
+#   segments.json             (from segmenter.py)
+#   content_description.json  (from describer.py)
+#
+# Nothing is written to any database. Run/job status (used only for
+# polling background jobs) is kept in memory for the life of the process.
+
+import json
+import time
+import uuid
+import threading
+
+_SCRIPT_DIR       = Path(__file__).parent
+TRANSCRIPT_PATH   = _SCRIPT_DIR / "transcript.txt"
+SEGMENTS_PATH     = _SCRIPT_DIR / "segments.json"
+DESCRIPTION_PATH  = _SCRIPT_DIR / "content_description.json"
+
+
+class _LocalStore:
+    """Drop-in replacement for the old `database` module.
+
+    Same function names/signatures as before. Transcript/segments/
+    description are persisted to local files in this folder; run
+    metadata (for job polling) lives only in memory.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._runs: dict[str, dict] = {}
+
+    # ---- runs (in-memory only, used for polling job status) ----
+    def new_run(self, kind: str, source: str) -> str:
+        run_id = str(uuid.uuid4())
+        with self._lock:
+            self._runs[run_id] = {
+                "run_id": run_id,
+                "type": kind,
+                "source": source,
+                "status": "processing",
+                "created_at": time.time(),
+                "error": None,
+            }
+        return run_id
+
+    def update_run_status(self, run_id: str, status: str, error: Optional[str] = None) -> None:
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is not None:
+                run["status"] = status
+                if error is not None:
+                    run["error"] = error
+
+    def list_runs(self, limit: int = 20) -> list:
+        with self._lock:
+            runs = sorted(self._runs.values(), key=lambda r: r["created_at"], reverse=True)
+        return runs[:limit]
+
+    def get_run(self, run_id: str) -> Optional[dict]:
+        with self._lock:
+            return self._runs.get(run_id)
+
+    # ---- transcript (saved to transcript.txt) ----
+    def save_transcript(self, transcript: str, run_id: Optional[str] = None) -> None:
+        TRANSCRIPT_PATH.write_text(transcript, encoding="utf-8")
+        if run_id:
+            with self._lock:
+                if run_id in self._runs:
+                    self._runs[run_id]["transcript"] = transcript
+
+    def get_transcript(self) -> Optional[str]:
+        if not TRANSCRIPT_PATH.exists():
+            return None
+        return TRANSCRIPT_PATH.read_text(encoding="utf-8")
+
+    # ---- segments (saved to segments.json) ----
+    def save_segments(self, segments: list, run_id: Optional[str] = None) -> None:
+        with open(SEGMENTS_PATH, "w", encoding="utf-8") as f:
+            json.dump(segments, f, indent=2, ensure_ascii=False)
+        if run_id:
+            with self._lock:
+                if run_id in self._runs:
+                    self._runs[run_id]["segments"] = segments
+
+    def get_segments(self) -> Optional[list]:
+        if not SEGMENTS_PATH.exists():
+            return None
+        with open(SEGMENTS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    # ---- description (saved to content_description.json) ----
+    def save_description(self, description: dict, run_id: Optional[str] = None) -> None:
+        with open(DESCRIPTION_PATH, "w", encoding="utf-8") as f:
+            json.dump(description, f, indent=2, ensure_ascii=False)
+        if run_id:
+            with self._lock:
+                if run_id in self._runs:
+                    self._runs[run_id]["description"] = description
+
+    def get_description(self) -> Optional[dict]:
+        if not DESCRIPTION_PATH.exists():
+            return None
+        with open(DESCRIPTION_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    # ---- status ----
+    def status(self) -> dict:
+        return {
+            "transcript":  TRANSCRIPT_PATH.exists(),
+            "segments":    SEGMENTS_PATH.exists(),
+            "description": DESCRIPTION_PATH.exists(),
+        }
+
+
+db = _LocalStore()
 
 
 # ─────────────────────────────────────────────
@@ -120,7 +240,7 @@ app = FastAPI(
     title="Video Pipeline API",
     description=(
         "Full pipeline: video/YouTube → transcribe → segment → describe. "
-        "Outputs stored in MongoDB. Long-running jobs return immediately with a "
+        "Outputs stored as local files in this folder. Long-running jobs return immediately with a "
         "run_id — poll GET /runs/{run_id} until status is 'done'."
     ),
     version="6.0.0",
@@ -174,7 +294,7 @@ def _require_transcript() -> str:
     if not transcript:
         raise HTTPException(
             status_code=404,
-            detail="No transcript found in MongoDB. Run POST /transcribe/video or /transcribe/youtube first.",
+            detail="No transcript found. Run POST /transcribe/video or /transcribe/youtube first.",
         )
     return transcript
 
@@ -184,7 +304,7 @@ def _require_segments() -> list:
     if not segments:
         raise HTTPException(
             status_code=404,
-            detail="No segments found in MongoDB. Run POST /segment first.",
+            detail="No segments found. Run POST /segment first.",
         )
     return segments
 
@@ -194,7 +314,7 @@ def _require_segments() -> list:
 # ─────────────────────────────────────────────
 
 def _bg_transcribe_video(run_id: str, tmp_path: str, tmp_dir: str) -> None:
-    """Background worker: transcribe a local video file and save to MongoDB."""
+    """Background worker: transcribe a local video file and save to local files."""
     try:
         client     = Groq(api_key=os.getenv("GROQ_API_KEY"))
         transcript = transcribe_from_video(tmp_path, client)
@@ -207,7 +327,7 @@ def _bg_transcribe_video(run_id: str, tmp_path: str, tmp_dir: str) -> None:
 
 
 def _bg_transcribe_youtube(run_id: str, url: str) -> None:
-    """Background worker: download + transcribe a YouTube URL and save to MongoDB."""
+    """Background worker: download + transcribe a YouTube URL and save to local files."""
     try:
         client     = Groq(api_key=os.getenv("GROQ_API_KEY"))
         transcript = transcribe_from_youtube(url, client)
@@ -261,7 +381,7 @@ def _bg_pipeline_youtube(run_id: str, url: str) -> None:
 
 @app.get("/status", response_model=StatusResponse)
 def get_status():
-    """Check which pipeline stages have been completed (based on latest run in MongoDB)."""
+    """Check which pipeline stages have been completed (based on local files)."""
     return StatusResponse(**db.status())
 
 
@@ -309,7 +429,7 @@ async def transcribe_youtube(background_tasks: BackgroundTasks, body: YoutubeReq
 
 @app.get("/transcript", response_model=TranscribeResponse)
 def get_transcript():
-    """Get the latest transcript from MongoDB."""
+    """Get the latest transcript from the local transcript.txt file."""
     return TranscribeResponse(transcript=_require_transcript())
 
 
@@ -320,7 +440,7 @@ def get_transcript():
 @app.post("/segment", response_model=SegmentResponse)
 def segment():
     """
-    Segment the latest transcript from MongoDB, save segments back to MongoDB.
+    Segment the latest transcript from the local file, save segments back to segments.json.
     """
     transcript = _require_transcript()
     segments   = segment_transcript(transcript, _client())
@@ -353,7 +473,7 @@ def segment_summaries():
 
 @app.get("/segments", response_model=SegmentResponse)
 def get_segments():
-    """Get the latest segments from MongoDB."""
+    """Get the latest segments from the local segments.json file."""
     segments = _require_segments()
     return SegmentResponse(segments=_to_segment_out(segments))
 
@@ -365,8 +485,8 @@ def get_segments():
 @app.post("/describe", response_model=DescribeResponse)
 def describe():
     """
-    Generate content description from the latest segments in MongoDB,
-    and save the description back to MongoDB.
+    Generate content description from the latest segments in the local file,
+    and save the description back to content_description.json.
     """
     segments    = _require_segments()
     client      = _client()
@@ -377,12 +497,12 @@ def describe():
 
 @app.get("/describe", response_model=DescribeResponse)
 def get_description():
-    """Get the latest content description from MongoDB."""
+    """Get the latest content description from content_description.json."""
     description = db.get_description()
     if not description:
         raise HTTPException(
             status_code=404,
-            detail="No description found in MongoDB. Run POST /describe first.",
+            detail="No description found. Run POST /describe first.",
         )
     return DescribeResponse(**description)
 
