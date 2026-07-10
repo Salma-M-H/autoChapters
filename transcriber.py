@@ -3,7 +3,7 @@
 transcribe.py  —  Step 1 of 3
 ==============================
 Extracts audio from a video file and transcribes it using Groq Whisper.
-Audio chunks are transcribed in parallel using ThreadPoolExecutor.
+Audio chunks are transcribed sequentially, one at a time.
 
 Output:
     transcript.txt   — every line is:  [HH:MM:SS] spoken text
@@ -20,8 +20,13 @@ import tempfile
 import shutil
 import subprocess
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
+
+import pydub.utils
+import pydub.audio_segment
+from pydub import AudioSegment
+
+
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -42,14 +47,9 @@ FFPROBE_PATH = os.getenv("FFPROBE_PATH", "ffprobe")
 MAX_RETRIES      = 5     # retries per chunk on connection error
 RETRY_DELAY      = 5     # seconds before first retry (doubles each attempt)
 MAX_CHUNK_MB     = 20    # raised from 15 → closer to Groq's 25 MB limit = fewer chunks
-MAX_WORKERS      = 3     # parallel Groq Whisper requests
 
 # ============================================================
-
-
 # ── Patch pydub BEFORE importing AudioSegment ──────────────
-import pydub.utils
-import pydub.audio_segment
 
 def _ffprobe_mediainfo_json(filename, read_ahead_limit=-1):
     cmd = [FFPROBE_PATH, "-v", "quiet", "-print_format", "json",
@@ -61,10 +61,11 @@ def _ffprobe_mediainfo_json(filename, read_ahead_limit=-1):
         )
     return json.loads(result.stdout)
 
+
 pydub.utils.mediainfo_json         = _ffprobe_mediainfo_json
 pydub.audio_segment.mediainfo_json = _ffprobe_mediainfo_json
 
-from pydub import AudioSegment
+
 
 AudioSegment.converter = FFMPEG_PATH
 AudioSegment.ffprobe   = FFPROBE_PATH
@@ -193,13 +194,11 @@ def transcribe_chunk_with_retry(chunk_path: str, client) -> object:
             delay *= 2
 
 
-def _process_chunk(args: tuple) -> tuple[int, object, float]:
+def _process_chunk(i: int, chunk, start_seconds: float, client, tmp_dir: str) -> tuple[int, object, float]:
     """
-    Worker function for parallel transcription.
-    Exports one chunk to a temp MP3, calls Groq Whisper, returns (index, transcription, start_seconds).
-    Each worker gets its own tmp file so there are no path collisions.
+    Exports one chunk to a temp MP3, calls Groq Whisper, returns
+    (index, transcription, start_seconds). Called once per chunk, in order.
     """
-    i, chunk, start_seconds, client, tmp_dir = args
     chunk_path = os.path.join(tmp_dir, f"chunk_{i}.mp3")
     chunk.export(chunk_path, format="mp3")
     print(f"      Chunk {i + 1}: starts at {format_timestamp(start_seconds)}, "
@@ -212,7 +211,7 @@ def _process_chunk(args: tuple) -> tuple[int, object, float]:
 def transcribe(audio_path: str, client) -> str:
     """
     Transcribe the audio and return the full transcript as a string.
-    Chunks are transcribed in parallel (MAX_WORKERS threads).
+    Chunks are transcribed sequentially, one after another.
     Each line: [HH:MM:SS] spoken text
     """
     print("[2/2] Transcribing with Groq Whisper...")
@@ -223,24 +222,10 @@ def transcribe(audio_path: str, client) -> str:
     tmp_dir      = tempfile.mkdtemp()
 
     try:
-        if total == 1:
-            # Single chunk — no need for a thread pool
-            chunk, start_seconds = audio_chunks[0]
-            _, transcription, start_seconds = _process_chunk(
-                (0, chunk, start_seconds, client, tmp_dir)
-            )
-            results[0] = (transcription, start_seconds)
-        else:
-            print(f"      Transcribing {total} chunks in parallel (max {MAX_WORKERS} workers)...")
-            task_args = [
-                (i, chunk, start_s, client, tmp_dir)
-                for i, (chunk, start_s) in enumerate(audio_chunks)
-            ]
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                futures = {executor.submit(_process_chunk, args): args[0] for args in task_args}
-                for future in as_completed(futures):
-                    i, transcription, start_seconds = future.result()
-                    results[i] = (transcription, start_seconds)
+        print(f"      Transcribing {total} chunk(s) sequentially...")
+        for i, (chunk, start_s) in enumerate(audio_chunks):
+            _, transcription, start_seconds = _process_chunk(i, chunk, start_s, client, tmp_dir)
+            results[i] = (transcription, start_seconds)
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
