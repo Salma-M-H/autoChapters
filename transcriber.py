@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 """
 transcribe.py  —  Step 1 of 3
 ==============================
@@ -38,11 +39,46 @@ VIDEO_PATH   = "المحاضرة الاولى المثابرة .عدم الته�
 OUTPUT_FILE  = "transcript.txt"
 
 # ffmpeg paths:
-#   - On Railway (Linux): leave as "ffmpeg" and "ffprobe" — available system-wide
+#   - On Railway (Linux): Automatically detected from system
 #   - On Windows locally: set FFMPEG_PATH and FFPROBE_PATH in your .env file
 #     e.g. FFMPEG_PATH=C:\Users\...\ffmpeg.exe
-FFMPEG_PATH  = os.getenv("FFMPEG_PATH",  "ffmpeg")
-FFPROBE_PATH = os.getenv("FFPROBE_PATH", "ffprobe")
+
+def _find_ffmpeg_path():
+    """Find ffmpeg in the system PATH or return default."""
+    # First check if explicitly set in env
+    if "FFMPEG_PATH" in os.environ:
+        return os.getenv("FFMPEG_PATH")
+    
+    # Try to find ffmpeg in PATH using 'which' (Unix-like systems)
+    try:
+        result = subprocess.run(['which', 'ffmpeg'], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    
+    # Fallback to 'ffmpeg' (will error if not found, which is what we want)
+    return "ffmpeg"
+
+def _find_ffprobe_path():
+    """Find ffprobe in the system PATH or return default."""
+    # First check if explicitly set in env
+    if "FFPROBE_PATH" in os.environ:
+        return os.getenv("FFPROBE_PATH")
+    
+    # Try to find ffprobe in PATH using 'which' (Unix-like systems)
+    try:
+        result = subprocess.run(['which', 'ffprobe'], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    
+    # Fallback to 'ffprobe' (will error if not found, which is what we want)
+    return "ffprobe"
+
+FFMPEG_PATH  = _find_ffmpeg_path()
+FFPROBE_PATH = _find_ffprobe_path()
 
 MAX_RETRIES      = 5     # retries per chunk on connection error
 RETRY_DELAY      = 5     # seconds before first retry (doubles each attempt)
@@ -87,9 +123,10 @@ def extract_audio(video_path: str, output_path: str) -> None:
         sys.exit(1)
 
     print(f"[1/2] Extracting audio from: {video_path}")
+    print(f"      (ffmpeg path: {FFMPEG_PATH})")
     clip  = VideoFileClip(video_path)
     audio = clip.audio
-    audio.write_audiofile(output_path, logger=None)
+    audio.write_audiofile(output_path, logger=None, verbose=False)
     audio.close()
     clip.close()
     print(f"      Saved to: {output_path}")
@@ -248,7 +285,7 @@ def download_audio_from_youtube(url: str, output_path: str) -> None:
     """Download audio from a YouTube URL and save as MP3 using yt-dlp."""
     print(f"[1/2] Downloading audio from YouTube: {url}")
 
-    ffmpeg_dir = str(Path(FFMPEG_PATH).parent) if FFMPEG_PATH != "ffmpeg" else None
+    ffmpeg_dir = str(Path(FFMPEG_PATH).parent) if FFMPEG_PATH and FFMPEG_PATH != "ffmpeg" else None
 
     cmd = [
         "yt-dlp",
@@ -331,3 +368,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
