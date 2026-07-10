@@ -1,0 +1,6 @@
+[build]
+builder = "nixpacks"
+
+[build.nixpacks]
+pkgs = ["ffmpeg", "yt-dlp"]
+
