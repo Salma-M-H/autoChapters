@@ -10,7 +10,7 @@ Output:
     transcript.txt   — every line is:  [HH:MM:SS] spoken text
 
 Requirements:
-    pip install groq moviepy pydub python-dotenv
+    pip install groq moviepy pydub python-dotenv requests
 """
 
 import os
@@ -20,6 +20,7 @@ import time
 import tempfile
 import shutil
 import subprocess
+import requests
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -126,7 +127,11 @@ def extract_audio(video_path: str, output_path: str) -> None:
     print(f"      (ffmpeg path: {FFMPEG_PATH})")
     clip  = VideoFileClip(video_path)
     audio = clip.audio
-    audio.write_audiofile(output_path, logger=None, verbose=False)
+    try:
+        audio.write_audiofile(output_path, logger=None, verbose=False)
+    except TypeError:
+        # moviepy 2.x dropped the 'verbose' kwarg — retry without it
+        audio.write_audiofile(output_path, logger=None)
     audio.close()
     clip.close()
     print(f"      Saved to: {output_path}")
@@ -281,26 +286,37 @@ def transcribe(audio_path: str, client) -> str:
     return "\n".join(lines)
 
 
-def download_audio_from_youtube(url: str, output_path: str) -> None:
-    """Download audio from a YouTube URL and save as MP3 using yt-dlp."""
-    print(f"[1/2] Downloading audio from YouTube: {url}")
+def download_video_from_youtube(url: str, output_path: str) -> None:
+    """Download a YouTube video (as .mp4) using the SocialKit API."""
+    print(f"[1/3] Downloading video from YouTube via SocialKit: {url}")
 
-    ffmpeg_dir = str(Path(FFMPEG_PATH).parent) if FFMPEG_PATH and FFMPEG_PATH != "ffmpeg" else None
+    api_key = os.getenv("SOCIALKIT_API_KEY")
+    if not api_key:
+        raise RuntimeError("SOCIALKIT_API_KEY not found in .env")
 
-    cmd = [
-        "yt-dlp",
-        "--extract-audio",
-        "--audio-format", "mp3",
-        "--audio-quality", "0",
-        "--output", output_path,
-    ]
-    if ffmpeg_dir:
-        cmd += ["--ffmpeg-location", ffmpeg_dir]
-    cmd.append(url)
+    response = requests.get(
+        "https://api.socialkit.dev/youtube/download",
+        params={
+            "access_key": api_key,
+            "url": url,
+        },
+    )
+    data = response.json()
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"yt-dlp failed:\n{result.stderr.strip()}")
+    if not data.get("success"):
+        raise RuntimeError(f"SocialKit request failed: {data}")
+
+    video_info   = data["data"]
+    download_url = video_info["downloadUrl"]
+    title        = video_info.get("title", "video")
+
+    print(f"      Fetching video bytes for: {title}")
+    video_response = requests.get(download_url)
+    video_response.raise_for_status()
+
+    with open(output_path, "wb") as f:
+        f.write(video_response.content)
+
     print(f"      Saved to: {output_path}")
 
 
@@ -320,13 +336,15 @@ def transcribe_from_video(video_path: str, client) -> str:
 
 def transcribe_from_youtube(url: str, client) -> str:
     """
-    Download audio from a YouTube URL and transcribe it.
+    Download a YouTube video via SocialKit, extract its audio, and transcribe it.
     Returns the full transcript string.
     """
     tmp_dir = tempfile.mkdtemp()
     try:
+        video_path = os.path.join(tmp_dir, "video.mp4")
         audio_path = os.path.join(tmp_dir, "audio.mp3")
-        download_audio_from_youtube(url, audio_path)
+        download_video_from_youtube(url, video_path)
+        extract_audio(video_path, audio_path)
         return transcribe(audio_path, client)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -368,4 +386,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

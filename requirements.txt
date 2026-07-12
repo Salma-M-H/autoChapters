@@ -5,6 +5,4 @@ uvicorn>=0.29.0
 python-multipart>=0.0.9
 moviepy>=1.0.3
 pydub>=0.25.1
-yt-dlp>=2024.1.0
 numpy<2
-
