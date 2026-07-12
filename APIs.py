@@ -255,6 +255,16 @@ app.add_middleware(
 
 
 # ─────────────────────────────────────────────
+# ROOT
+# ─────────────────────────────────────────────
+
+@app.get("/")
+def root():
+    """Health check — confirms the API is up and running."""
+    return {"status": "ok", "message": "Welcome to the autoChapters Video Pipeline API. Visit /docs for the full API reference."}
+
+
+# ─────────────────────────────────────────────
 # Shared helpers
 # ─────────────────────────────────────────────
 
