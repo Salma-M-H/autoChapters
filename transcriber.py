@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 """
 transcribe.py  —  Step 1 of 3
 ==============================
@@ -40,46 +39,11 @@ VIDEO_PATH   = "المحاضرة الاولى المثابرة .عدم الته�
 OUTPUT_FILE  = "transcript.txt"
 
 # ffmpeg paths:
-#   - On Railway (Linux): Automatically detected from system
+#   - On Railway (Linux): leave as "ffmpeg" and "ffprobe" — available system-wide
 #   - On Windows locally: set FFMPEG_PATH and FFPROBE_PATH in your .env file
 #     e.g. FFMPEG_PATH=C:\Users\...\ffmpeg.exe
-
-def _find_ffmpeg_path():
-    """Find ffmpeg in the system PATH or return default."""
-    # First check if explicitly set in env
-    if "FFMPEG_PATH" in os.environ:
-        return os.getenv("FFMPEG_PATH")
-    
-    # Try to find ffmpeg in PATH using 'which' (Unix-like systems)
-    try:
-        result = subprocess.run(['which', 'ffmpeg'], capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except Exception:
-        pass
-    
-    # Fallback to 'ffmpeg' (will error if not found, which is what we want)
-    return "ffmpeg"
-
-def _find_ffprobe_path():
-    """Find ffprobe in the system PATH or return default."""
-    # First check if explicitly set in env
-    if "FFPROBE_PATH" in os.environ:
-        return os.getenv("FFPROBE_PATH")
-    
-    # Try to find ffprobe in PATH using 'which' (Unix-like systems)
-    try:
-        result = subprocess.run(['which', 'ffprobe'], capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except Exception:
-        pass
-    
-    # Fallback to 'ffprobe' (will error if not found, which is what we want)
-    return "ffprobe"
-
-FFMPEG_PATH  = _find_ffmpeg_path()
-FFPROBE_PATH = _find_ffprobe_path()
+FFMPEG_PATH  = os.getenv("FFMPEG_PATH",  "ffmpeg")
+FFPROBE_PATH = os.getenv("FFPROBE_PATH", "ffprobe")
 
 MAX_RETRIES      = 5     # retries per chunk on connection error
 RETRY_DELAY      = 5     # seconds before first retry (doubles each attempt)
@@ -124,14 +88,9 @@ def extract_audio(video_path: str, output_path: str) -> None:
         sys.exit(1)
 
     print(f"[1/2] Extracting audio from: {video_path}")
-    print(f"      (ffmpeg path: {FFMPEG_PATH})")
     clip  = VideoFileClip(video_path)
     audio = clip.audio
-    try:
-        audio.write_audiofile(output_path, logger=None, verbose=False)
-    except TypeError:
-        # moviepy 2.x dropped the 'verbose' kwarg — retry without it
-        audio.write_audiofile(output_path, logger=None)
+    audio.write_audiofile(output_path, logger=None)
     audio.close()
     clip.close()
     print(f"      Saved to: {output_path}")
@@ -169,7 +128,7 @@ def chunk_audio_preserve_timing(audio_path: str) -> list[tuple[AudioSegment, flo
     is the exact position of that chunk in the original audio.
     """
     MAX_BYTES       = MAX_CHUNK_MB * 1024 * 1024
-    audio           = AudioSegment.from_mp3(audio_path)
+    audio           = AudioSegment.from_file(audio_path)  # auto-detects format (mp3, m4a, wav, etc.)
     total_ms        = len(audio)
     file_size       = os.path.getsize(audio_path)
 
@@ -332,6 +291,16 @@ def transcribe_from_video(video_path: str, client) -> str:
         return transcribe(audio_path, client)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def transcribe_from_audio_file(audio_path: str, client) -> str:
+    """
+    Transcribe an audio file directly — no video/extraction step needed.
+    Accepts any format ffmpeg can decode (mp3, m4a, wav, aac, ogg, etc.),
+    since chunk_audio_preserve_timing() auto-detects format via
+    AudioSegment.from_file(). Returns the full transcript string.
+    """
+    return transcribe(audio_path, client)
 
 
 def transcribe_from_youtube(url: str, client) -> str:

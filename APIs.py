@@ -23,8 +23,9 @@ never ran the job.
 Endpoints:
 
   TRANSCRIPTION  (no timestamps)
-    POST /transcribe/video            — upload video  → 202 + job_id (poll /jobs/{job_id})
-    POST /transcribe/youtube          — YouTube URL   → returns transcript (plain text, no timestamps)
+    POST /transcribe/audio             — upload audio  → 202 + job_id (poll /jobs/{job_id}) — PREFERRED, smaller upload
+    POST /transcribe/video             — upload video  → 202 + job_id (poll /jobs/{job_id})
+    POST /transcribe/youtube           — YouTube URL   → returns transcript (plain text, no timestamps)
 
   SEGMENTATION
     POST /segment                     — transcript in body → returns segments
@@ -35,7 +36,9 @@ Endpoints:
     POST /describe                    — segments in body  → returns description
 
   FULL PIPELINE
-    POST /pipeline/video              — upload video  → 202 + job_id (poll /jobs/{job_id})
+    POST /pipeline/audio               — upload audio  → 202 + job_id (poll /jobs/{job_id}) — PREFERRED, smaller upload
+    POST /pipeline/video               — upload video  → 202 + job_id (poll /jobs/{job_id})
+    POST /pipeline/video/sync         — BENCHMARK ONLY: same pipeline, blocks until done
     POST /pipeline/youtube            — YouTube URL   → returns transcript + segments + description
 
   JOBS
@@ -61,7 +64,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from groq import Groq
 
-from transcriber import transcribe_from_video, transcribe_from_youtube
+from transcriber import transcribe_from_video, transcribe_from_youtube, transcribe_from_audio_file
 from segmenter   import segment_transcript
 from describer   import build_segments_summary, generate_description
 
@@ -217,6 +220,37 @@ def _run_transcribe_video_job(job_id: str, tmp_path: str, tmp_dir: str) -> None:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def _run_transcribe_audio_job(job_id: str, audio_path: str, tmp_dir: str) -> None:
+    _set_job(job_id, status="processing")
+    try:
+        transcript = transcribe_from_audio_file(audio_path, _client())
+        result = TranscribeResponse(transcript=strip_timestamps(transcript))
+        _set_job(job_id, status="completed", result=result.model_dump())
+    except Exception as e:
+        _set_job(job_id, status="failed", error=str(e))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _run_pipeline_audio_job(job_id: str, audio_path: str, tmp_dir: str) -> None:
+    _set_job(job_id, status="processing")
+    try:
+        client      = _client()
+        transcript  = transcribe_from_audio_file(audio_path, client)
+        segments    = segment_transcript(transcript, client)
+        description = generate_description(build_segments_summary(segments), client)
+        result = PipelineResponse(
+            transcript=transcript,
+            segments=_to_segment_out(segments),
+            description=DescribeResponse(**description),
+        )
+        _set_job(job_id, status="completed", result=result.model_dump())
+    except Exception as e:
+        _set_job(job_id, status="failed", error=str(e))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def _run_pipeline_video_job(job_id: str, tmp_path: str, tmp_dir: str) -> None:
     _set_job(job_id, status="processing")
     try:
@@ -270,6 +304,27 @@ async def transcribe_video(file: UploadFile = File(...)):
     with _jobs_lock:
         _jobs[job_id] = {"job_id": job_id, "status": "pending", "result": None, "error": None}
     _job_executor.submit(_run_transcribe_video_job, job_id, tmp_path, tmp_dir)
+    return JSONResponse(status_code=202, content={"job_id": job_id, "status": "pending"})
+
+
+@app.post("/transcribe/audio", response_model=JobQueuedResponse, status_code=202)
+async def transcribe_audio(file: UploadFile = File(...)):
+    """
+    Upload an AUDIO file directly (mp3, m4a, wav, aac, ogg, etc.) — no
+    video, no extraction step. Use this instead of /transcribe/video
+    whenever the client can send audio only: it's a much smaller upload,
+    which avoids the slow-connection timeout issue large video uploads
+    can hit on Railway.
+
+    Queues transcription as a background job and returns immediately
+    with a job_id. Poll GET /jobs/{job_id} — once status is "completed",
+    result.transcript holds the plain-text transcript (no timestamps).
+    """
+    tmp_path, tmp_dir = await _save_upload(file)
+    job_id = str(uuid.uuid4())
+    with _jobs_lock:
+        _jobs[job_id] = {"job_id": job_id, "status": "pending", "result": None, "error": None}
+    _job_executor.submit(_run_transcribe_audio_job, job_id, tmp_path, tmp_dir)
     return JSONResponse(status_code=202, content={"job_id": job_id, "status": "pending"})
 
 
@@ -369,6 +424,55 @@ async def pipeline_video(file: UploadFile = File(...)):
         _jobs[job_id] = {"job_id": job_id, "status": "pending", "result": None, "error": None}
     _job_executor.submit(_run_pipeline_video_job, job_id, tmp_path, tmp_dir)
     return JSONResponse(status_code=202, content={"job_id": job_id, "status": "pending"})
+
+
+@app.post("/pipeline/audio", response_model=JobQueuedResponse, status_code=202)
+async def pipeline_audio(file: UploadFile = File(...)):
+    """
+    Upload an AUDIO file directly (mp3, m4a, wav, aac, ogg, etc.) and
+    queue the full pipeline (transcribe → segment → describe) as a
+    background job. Prefer this over /pipeline/video when the client can
+    send audio only — the smaller upload avoids the slow-connection
+    timeout issue large video uploads can hit on Railway.
+
+    Returns immediately with a job_id. Poll GET /jobs/{job_id} — once
+    status is "completed", result holds transcript + segments +
+    description, matching PipelineResponse.
+    """
+    tmp_path, tmp_dir = await _save_upload(file)
+    job_id = str(uuid.uuid4())
+    with _jobs_lock:
+        _jobs[job_id] = {"job_id": job_id, "status": "pending", "result": None, "error": None}
+    _job_executor.submit(_run_pipeline_audio_job, job_id, tmp_path, tmp_dir)
+    return JSONResponse(status_code=202, content={"job_id": job_id, "status": "pending"})
+
+
+@app.post("/pipeline/video/sync", response_model=PipelineResponse)
+async def pipeline_video_sync(file: UploadFile = File(...)):
+    """
+    BENCHMARK-ONLY. Runs the exact same pipeline as /pipeline/video, but
+    synchronously — blocks until the full result is ready, like the
+    original (pre-job-queue) endpoint did.
+
+    This exists so benchmark.py can measure sync vs. job-based timing
+    side by side. Do NOT use this in production on Railway — it's the
+    endpoint that was hitting the request timeout in the first place.
+    """
+    tmp_path, tmp_dir = await _save_upload(file)
+    try:
+        client      = _client()
+        transcript  = transcribe_from_video(tmp_path, client)
+        segments    = segment_transcript(transcript, client)
+        description = generate_description(build_segments_summary(segments), client)
+        return PipelineResponse(
+            transcript=transcript,
+            segments=_to_segment_out(segments),
+            description=DescribeResponse(**description),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 @app.post("/pipeline/youtube", response_model=PipelineResponse)
