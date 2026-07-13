@@ -158,20 +158,20 @@ async def _save_upload(file: UploadFile) -> tuple[str, str]:
 # TRANSCRIPTION
 # ─────────────────────────────────────────────
 
-@app.post("/transcribe/audio", response_model=TranscribeResponse)
-async def transcribe_audio(file: UploadFile = File(...)):
-    """
-    Upload an audio file directly (mp3, m4a, wav, aac, ogg, etc.) — no
-    video, no extraction step. Returns the full transcript as plain text.
-    """
-    tmp_path, tmp_dir = await _save_upload(file)
-    try:
-        transcript = transcribe_from_audio_file(tmp_path, _client())
-        return TranscribeResponse(transcript=strip_timestamps(transcript))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+# @app.post("/transcribe/audio", response_model=TranscribeResponse)
+# async def transcribe_audio(file: UploadFile = File(...)):
+#     """
+#     Upload an audio file directly (mp3, m4a, wav, aac, ogg, etc.) — no
+#     video, no extraction step. Returns the full transcript as plain text.
+#     """
+#     tmp_path, tmp_dir = await _save_upload(file)
+#     try:
+#         transcript = transcribe_from_audio_file(tmp_path, _client())
+#         return TranscribeResponse(transcript=strip_timestamps(transcript))
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
+#     finally:
+#         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 @app.post("/transcribe/video", response_model=TranscribeResponse)
@@ -272,31 +272,31 @@ async def transcribe_youtube(body: YoutubeRequest):
 # FULL PIPELINE
 # ─────────────────────────────────────────────
 
-@app.post("/pipeline/audio", response_model=PipelineResponse)
-async def pipeline_audio(file: UploadFile = File(...)):
-    """
-    Upload an audio file directly (mp3, m4a, wav, aac, ogg, etc.) and run
-    the full pipeline end-to-end:
-      1. Transcribe
-      2. Segment into topics
-      3. Generate content description
-    Returns all three results in one response.
-    """
-    tmp_path, tmp_dir = await _save_upload(file)
-    try:
-        client      = _client()
-        transcript  = transcribe_from_audio_file(tmp_path, client)
-        segments    = segment_transcript(transcript, client)
-        description = generate_description(build_segments_summary(segments), client)
-        return PipelineResponse(
-            transcript=transcript,
-            segments=_to_segment_out(segments),
-            description=DescribeResponse(**description),
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+# @app.post("/pipeline/audio", response_model=PipelineResponse)
+# async def pipeline_audio(file: UploadFile = File(...)):
+#     """
+#     Upload an audio file directly (mp3, m4a, wav, aac, ogg, etc.) and run
+#     the full pipeline end-to-end:
+#       1. Transcribe
+#       2. Segment into topics
+#       3. Generate content description
+#     Returns all three results in one response.
+#     """
+#     tmp_path, tmp_dir = await _save_upload(file)
+#     try:
+#         client      = _client()
+#         transcript  = transcribe_from_audio_file(tmp_path, client)
+#         segments    = segment_transcript(transcript, client)
+#         description = generate_description(build_segments_summary(segments), client)
+#         return PipelineResponse(
+#             transcript=transcript,
+#             segments=_to_segment_out(segments),
+#             description=DescribeResponse(**description),
+#         )
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
+#     finally:
+#         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 @app.post("/pipeline/video", response_model=PipelineResponse)
